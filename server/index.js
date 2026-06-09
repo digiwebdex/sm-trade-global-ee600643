@@ -11,6 +11,9 @@ app.use(express.json({ limit: '10mb' }));
 
 const PORT = Number(process.env.PORT || 3105);
 
+// In-memory sessions: token -> user. Cleared on server restart (users must log in again).
+const sessions = new Map();
+
 // Support an isolated API prefix for this app on shared VPS domains.
 // Requests to /smtrade-api/* are handled by the same routes as /api/*.
 app.use((req, _res, next) => {
@@ -47,8 +50,17 @@ app.post('/api/auth/login', async (req, res) => {
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const user = rows[0];
+    const token = uuidv4();
+    sessions.set(token, {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+      email: user.email,
+      createdAt: user.created_at,
+    });
     res.json({
-      token: uuidv4(),
+      token,
       user: { id: user.id, username: user.username, name: user.name, role: user.role, email: user.email, createdAt: user.created_at }
     });
   } catch (err) {
@@ -80,6 +92,91 @@ app.post('/api/auth/change-password', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Public document verification (no auth required)
+app.get('/api/verify/:type/:docId', async (req, res) => {
+  try {
+    const { type, docId } = req.params;
+    const normalized = String(docId).toLowerCase().replace(/[^a-z0-9-]/g, '-');
+
+    const findByNumber = async (rows, numberField) =>
+      rows.find((r) => String(r[numberField]).toLowerCase().replace(/[^a-z0-9-]/g, '-') === normalized);
+
+    if (type === 'invoice') {
+      const [rows] = await pool.query(`SELECT id, invoice_number as invoiceNumber, date, customer_name as customerName,
+        customer_address as customerAddress, customer_phone as customerPhone, customer_email as customerEmail,
+        total_amount as totalAmount, tax, total_paid as totalPaid, status, amount_in_words as amountInWords,
+        signature_received as signatureReceived, signature_prepared as signaturePrepared,
+        signature_authorize as signatureAuthorize, notes FROM invoices`);
+      const doc = await findByNumber(rows, 'invoiceNumber');
+      if (!doc) return res.status(404).json({ error: 'Document not found' });
+      const [items] = await pool.query('SELECT id, description, quantity, unit_price as unitPrice, total FROM invoice_items WHERE invoice_id=?', [doc.id]);
+      const [payments] = await pool.query('SELECT id, date, method, description, amount FROM invoice_payments WHERE invoice_id=?', [doc.id]);
+      return res.json({ ...doc, items, payments });
+    }
+
+    if (type === 'quotation') {
+      const [rows] = await pool.query(`SELECT id, quotation_number as quotationNumber, date, customer_name as customerName,
+        customer_address as customerAddress, customer_phone as customerPhone, total_amount as totalAmount, status,
+        amount_in_words as amountInWords, signature_received as signatureReceived, signature_prepared as signaturePrepared,
+        signature_authorize as signatureAuthorize, notes FROM quotations`);
+      const doc = await findByNumber(rows, 'quotationNumber');
+      if (!doc) return res.status(404).json({ error: 'Document not found' });
+      const [items] = await pool.query('SELECT id, description, quantity, unit_price as unitPrice, total FROM quotation_items WHERE quotation_id=?', [doc.id]);
+      return res.json({ ...doc, items });
+    }
+
+    if (type === 'challan') {
+      const [rows] = await pool.query(`SELECT id, challan_number as challanNumber, date, customer_name as customerName,
+        customer_address as customerAddress, customer_phone as customerPhone, total_quantity as totalQuantity,
+        order_no as orderNo, status, signature_received as signatureReceived, signature_prepared as signaturePrepared,
+        signature_authorize as signatureAuthorize, notes FROM challans`);
+      const doc = await findByNumber(rows, 'challanNumber');
+      if (!doc) return res.status(404).json({ error: 'Document not found' });
+      const [items] = await pool.query('SELECT id, description, quantity, unit_price as unitPrice, total FROM challan_items WHERE challan_id=?', [doc.id]);
+      return res.json({ ...doc, items });
+    }
+
+    if (type === 'purchase-order') {
+      const [rows] = await pool.query(`SELECT id, po_number as poNumber, date, supplier_name as supplierName,
+        supplier_address as supplierAddress, supplier_phone as supplierPhone, total_amount as totalAmount, status,
+        amount_in_words as amountInWords, signature_received as signatureReceived, signature_prepared as signaturePrepared,
+        signature_authorize as signatureAuthorize, notes FROM purchase_orders`);
+      const doc = await findByNumber(rows, 'poNumber');
+      if (!doc) return res.status(404).json({ error: 'Document not found' });
+      const [items] = await pool.query('SELECT id, description, quantity, unit_price as unitPrice, total FROM purchase_order_items WHERE po_id=?', [doc.id]);
+      return res.json({ ...doc, items });
+    }
+
+    return res.status(400).json({ error: 'Invalid document type' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Protect all API routes below except health and login
+app.use((req, res, next) => {
+  if (req.path === '/api/health' || req.path === '/api/auth/login' || req.path.startsWith('/api/verify/')) {
+    return next();
+  }
+  if (!req.path.startsWith('/api/')) return next();
+
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const token = header.slice(7);
+  const user = sessions.get(token);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+  req.user = user;
+  next();
+});
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({ user: req.user });
 });
 
 // ============ USERS ============

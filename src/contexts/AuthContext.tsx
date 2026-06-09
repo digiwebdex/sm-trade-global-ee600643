@@ -1,6 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { User } from '@/types';
-import { api } from '@/utils/api';
+import { api, setUnauthorizedHandler } from '@/utils/api';
 
 interface AuthContextType {
   user: User | null;
@@ -14,13 +14,27 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
 
+  const logout = useCallback(() => {
+    setUser(null);
+    localStorage.removeItem('sm_current_user');
+    localStorage.removeItem('sm_auth_token');
+  }, []);
+
   useEffect(() => {
     const saved = localStorage.getItem('sm_current_user');
     const token = localStorage.getItem('sm_auth_token');
     if (saved && token) {
-      try { setUser(JSON.parse(saved)); } catch { /* ignore */ }
+      try {
+        setUser(JSON.parse(saved));
+        api.me().catch(() => logout());
+      } catch { /* ignore */ }
     }
-  }, []);
+  }, [logout]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(logout);
+    return () => setUnauthorizedHandler(null);
+  }, [logout]);
 
   const login = async (email: string, password: string): Promise<boolean> => {
     try {
@@ -36,12 +50,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return false;
     }
-  };
-
-  const logout = () => {
-    setUser(null);
-    localStorage.removeItem('sm_current_user');
-    localStorage.removeItem('sm_auth_token');
   };
 
   return (

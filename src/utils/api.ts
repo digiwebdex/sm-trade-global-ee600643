@@ -2,6 +2,12 @@
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  onUnauthorized = handler;
+}
+
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const token = localStorage.getItem('sm_auth_token');
   const headers: Record<string, string> = {
@@ -16,6 +22,9 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
+    if (res.status === 401 && !endpoint.startsWith('/auth/login')) {
+      onUnauthorized?.();
+    }
     throw new Error(err.error || 'API request failed');
   }
   return res.json();
@@ -25,6 +34,7 @@ export const api = {
   // Auth
   login: (email: string, password: string) =>
     request('/auth/login', { method: 'POST', body: JSON.stringify({ username: email, email, password }) }),
+  me: () => request<{ user: unknown }>('/auth/me'),
   changePassword: (userId: string, currentPassword: string, newPassword: string) =>
     request('/auth/change-password', { method: 'POST', body: JSON.stringify({ userId, currentPassword, newPassword }) }),
 
@@ -80,4 +90,7 @@ export const api = {
 
   // Dashboard
   getDashboardStats: () => request('/dashboard/stats'),
+
+  // Public verification
+  verifyDocument: (type: string, docId: string) => request(`/verify/${type}/${docId}`),
 };

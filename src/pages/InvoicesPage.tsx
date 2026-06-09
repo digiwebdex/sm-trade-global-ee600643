@@ -24,12 +24,21 @@ export default function InvoicesPage() {
   const { action } = useParams();
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
 
   const load = async () => {
+    setLoading(true);
+    setLoadError(false);
     try {
       const data = await api.getInvoices() as Invoice[];
       setInvoices(data);
-    } catch (err) { toast.error('Failed to load invoices'); }
+    } catch (err) {
+      setLoadError(true);
+      toast.error('Failed to load invoices. Please log out and log in again.');
+    } finally {
+      setLoading(false);
+    }
   };
   useEffect(() => { load(); }, [action]);
 
@@ -41,7 +50,10 @@ export default function InvoicesPage() {
     return <InvoiceView id={action.replace('view-', '')} onBack={() => navigate('/invoices')} />;
   }
 
-  const filtered = invoices.filter(i => i.invoiceNumber.toLowerCase().includes(search.toLowerCase()) || i.customerName.toLowerCase().includes(search.toLowerCase()));
+  const filtered = invoices.filter(i =>
+    (i.invoiceNumber || '').toLowerCase().includes(search.toLowerCase()) ||
+    (i.customerName || '').toLowerCase().includes(search.toLowerCase())
+  );
 
   const handleDelete = async (id: string) => {
     if (confirm('Delete this invoice?')) {
@@ -97,8 +109,12 @@ export default function InvoicesPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.length === 0 ? (
-                <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">No invoices found</TableCell></TableRow>
+              {loading ? (
+                <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">Loading invoices...</TableCell></TableRow>
+              ) : loadError ? (
+                <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">Could not load invoices. Log out and log in again, or contact support.</TableCell></TableRow>
+              ) : filtered.length === 0 ? (
+                <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">{search ? 'No invoices match your search' : 'No invoices found'}</TableCell></TableRow>
               ) : filtered.map((inv) => (
                 <TableRow key={inv.id} className="cursor-pointer hover:bg-muted/50" onClick={() => navigate(`/invoices/view-${inv.id}`)}>
                   <TableCell className="font-bold text-primary">{inv.invoiceNumber}</TableCell>

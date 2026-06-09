@@ -15,24 +15,11 @@ export default function VerifyPage() {
   const [found, setFound] = useState(false);
 
   useEffect(() => {
-    const fetchMap: Record<string, { fetch: () => Promise<unknown>; numberField: string }> = {
-      invoice: { fetch: () => api.getInvoices(), numberField: 'invoiceNumber' },
-      quotation: { fetch: () => api.getQuotations(), numberField: 'quotationNumber' },
-      challan: { fetch: () => api.getChallans(), numberField: 'challanNumber' },
-      'purchase-order': { fetch: () => api.getPurchaseOrders(), numberField: 'poNumber' },
-    };
+    if (!type || !docId) { setLoading(false); return; }
 
-    const config = fetchMap[type || ''];
-    if (!config || !docId) { setLoading(false); return; }
-
-    config.fetch().then((docs: any) => {
-      const doc = docs.find((d: any) => {
-        const num = d[config.numberField]?.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-        return num === docId;
-      });
-      if (doc) { setDocument(doc); setFound(true); }
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    api.verifyDocument(type, docId)
+      .then((doc: any) => { setDocument(doc); setFound(true); setLoading(false); })
+      .catch(() => setLoading(false));
   }, [type, docId]);
 
   if (loading) {
