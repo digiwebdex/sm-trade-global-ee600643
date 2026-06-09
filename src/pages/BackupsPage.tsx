@@ -5,7 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
 import { useAuth } from '@/contexts/AuthContext';
 import {
-  Database, Download, Trash2, RefreshCw, HardDrive, Clock, CloudUpload, Loader2,
+  Database, Download, Trash2, RefreshCw, HardDrive, Clock, CloudUpload, Loader2, RotateCcw,
 } from 'lucide-react';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -44,6 +44,7 @@ export default function BackupsPage() {
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [uploadingDrive, setUploadingDrive] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
 
   const token = localStorage.getItem('sm_auth_token');
   const headers: Record<string, string> = {
@@ -115,6 +116,22 @@ export default function BackupsPage() {
       fetchBackups();
     } catch (err: any) {
       toast.error(err.message || 'Delete failed');
+    }
+  };
+
+  const restoreBackup = async (filename: string) => {
+    try {
+      setRestoring(filename);
+      const res = await fetch(`${API_BASE}/backups/${encodeURIComponent(filename)}/restore`, {
+        method: 'POST', headers,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Restore failed');
+      toast.success(`ডাটাবেস রিস্টোর হয়েছে। ইনভয়েস: ${data.invoiceCount ?? '?'}`);
+    } catch (err: any) {
+      toast.error(err.message || 'Restore failed');
+    } finally {
+      setRestoring(null);
     }
   };
 
@@ -205,6 +222,35 @@ export default function BackupsPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          variant="ghost" size="icon" className="h-8 w-8 text-emerald-600 hover:text-emerald-700"
+                          disabled={restoring === b.filename}
+                          title="রিস্টোর"
+                        >
+                          {restoring === b.filename ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <RotateCcw className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>ডাটাবেস রিস্টোর করবেন?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            "{b.filename}" থেকে রিস্টোর করলে বর্তমান সব ডাটা প্রতিস্থাপিত হবে।
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>বাতিল</AlertDialogCancel>
+                          <AlertDialogAction onClick={() => restoreBackup(b.filename)}>
+                            রিস্টোর করুন
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                     <Button
                       variant="ghost" size="icon" className="h-8 w-8"
                       onClick={() => downloadBackup(b.filename)}

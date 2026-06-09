@@ -1,9 +1,45 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const { execFile, spawn } = require('child_process');
+const { promisify } = require('util');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const pool = require('./db');
+
+const execFileAsync = promisify(execFile);
+const BACKUP_DIR = path.join(__dirname, 'backups');
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+const DB_HOST = process.env.DB_HOST || 'localhost';
+const DB_USER = process.env.DB_USER || 'smtrade_user';
+const DB_PASSWORD = process.env.DB_PASSWORD || 'StrongPass123!';
+const DB_NAME = process.env.DB_NAME || 'smtrade_db';
+
+function safeBackupName(filename) {
+  return /^smtrade_backup_[\w-]+\.sql$/.test(filename) ? filename : null;
+}
+
+async function runMysqlDump(outFile) {
+  const { stdout } = await execFileAsync('mysqldump', [
+    '-h', DB_HOST, '-u', DB_USER, `--password=${DB_PASSWORD}`,
+    '--single-transaction', '--routines', '--triggers', DB_NAME,
+  ], { maxBuffer: 50 * 1024 * 1024 });
+  fs.writeFileSync(outFile, stdout);
+}
+
+function runMysqlRestore(inFile) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('mysql', ['-h', DB_HOST, '-u', DB_USER, `-p${DB_PASSWORD}`, DB_NAME]);
+    const stream = fs.createReadStream(inFile);
+    stream.pipe(proc.stdin);
+    let err = '';
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err || `mysql exited ${code}`))));
+    stream.on('error', reject);
+  });
+}
 
 const app = express();
 app.use(cors());
@@ -657,6 +693,91 @@ app.put('/api/settings', async (req, res) => {
          d.signatureReceived || '', d.signaturePrepared || '', d.signatureAuthorize || '']);
     }
     res.json(d);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============ DB DIAGNOSTICS (admin) ============
+app.get('/api/diagnostics', async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const [[{ invoiceCount }]] = await pool.query('SELECT COUNT(*) as invoiceCount FROM invoices');
+    const [[{ customerCount }]] = await pool.query('SELECT COUNT(*) as customerCount FROM customers');
+    const [[{ quotationCount }]] = await pool.query('SELECT COUNT(*) as quotationCount FROM quotations');
+    const [invoices] = await pool.query(
+      'SELECT id, invoice_number as invoiceNumber, customer_name as customerName, date, total_amount as totalAmount, status, created_at as createdAt FROM invoices ORDER BY created_at DESC LIMIT 20'
+    );
+    const [databases] = await pool.query('SHOW DATABASES');
+    res.json({
+      database: DB_NAME,
+      host: DB_HOST,
+      invoiceCount, customerCount, quotationCount,
+      recentInvoices: invoices,
+      databases: databases.map((d) => d.Database),
+      backupDir: BACKUP_DIR,
+      backupFiles: fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.sql')),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============ BACKUPS ============
+app.get('/api/backups', async (req, res) => {
+  try {
+    const files = fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.sql'));
+    const backups = files.map((filename) => {
+      const stat = fs.statSync(path.join(BACKUP_DIR, filename));
+      return {
+        filename,
+        size: stat.size,
+        created: stat.mtime.toISOString(),
+        type: filename.includes('_auto_') ? 'auto' : 'manual',
+      };
+    }).sort((a, b) => new Date(b.created) - new Date(a.created));
+    res.json(backups);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/backups', async (req, res) => {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `smtrade_backup_manual_${ts}.sql`;
+    const outFile = path.join(BACKUP_DIR, filename);
+    await runMysqlDump(outFile);
+    res.json({ filename, size: fs.statSync(outFile).size });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/backups/:filename/download', async (req, res) => {
+  try {
+    const filename = safeBackupName(req.params.filename);
+    if (!filename) return res.status(400).json({ error: 'Invalid filename' });
+    const filePath = path.join(BACKUP_DIR, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+    res.download(filePath);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/backups/:filename', async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const filename = safeBackupName(req.params.filename);
+    if (!filename) return res.status(400).json({ error: 'Invalid filename' });
+    const filePath = path.join(BACKUP_DIR, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+    fs.unlinkSync(filePath);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/backups/:filename/restore', async (req, res) => {
+  try {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const filename = safeBackupName(req.params.filename);
+    if (!filename) return res.status(400).json({ error: 'Invalid filename' });
+    const filePath = path.join(BACKUP_DIR, filename);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+    await runMysqlRestore(filePath);
+    const [[{ invoiceCount }]] = await pool.query('SELECT COUNT(*) as invoiceCount FROM invoices');
+    res.json({ success: true, message: 'Database restored', invoiceCount });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
