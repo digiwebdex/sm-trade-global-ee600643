@@ -7,6 +7,14 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const pool = require('./db');
+const {
+  signToken,
+  hashPassword,
+  verifyPassword,
+  maybeUpgradePasswordHash,
+  requireAuth,
+  sanitizeUser,
+} = require('./auth');
 
 const execFileAsync = promisify(execFile);
 const BACKUP_DIR = path.join(__dirname, 'backups');
@@ -42,13 +50,24 @@ function runMysqlRestore(inFile) {
 }
 
 const app = express();
-app.use(cors());
+const ALLOWED_ORIGINS = [
+  'https://soft.smtradeint.com',
+  'http://localhost:8080',
+  'http://localhost:5173',
+];
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, true);
+    }
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = Number(process.env.PORT || 3105);
-
-// In-memory sessions: token -> user. Cleared on server restart (users must log in again).
-const sessions = new Map();
 
 // Support an isolated API prefix for this app on shared VPS domains.
 // Requests to /smtrade-api/* are handled by the same routes as /api/*.
@@ -71,7 +90,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ============ AUTH ============
+// ============ AUTH (public) ============
 app.post('/api/auth/login', async (req, res) => {
   try {
     const username = String(req.body?.username || req.body?.email || '').trim().toLowerCase();
@@ -80,51 +99,20 @@ app.post('/api/auth/login', async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT * FROM users
-       WHERE (LOWER(TRIM(username)) = ? OR LOWER(TRIM(email)) = ?)
-         AND password = ?`,
-      [username, username, password]
+       WHERE LOWER(TRIM(username)) = ? OR LOWER(TRIM(email)) = ?`,
+      [username, username]
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
-    const user = rows[0];
-    const token = uuidv4();
-    sessions.set(token, {
-      id: user.id,
-      username: user.username,
-      name: user.name,
-      role: user.role,
-      email: user.email,
-      createdAt: user.created_at,
-    });
-    res.json({
-      token,
-      user: { id: user.id, username: user.username, name: user.name, role: user.role, email: user.email, createdAt: user.created_at }
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
-app.post('/api/auth/change-password', async (req, res) => {
-  try {
-    const userId = String(req.body?.userId || '').trim();
-    const currentPassword = String(req.body?.currentPassword || '');
-    const newPassword = String(req.body?.newPassword || '');
-    if (!userId || !currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'User ID, current password and new password are required' });
-    }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
-    }
-    if (newPassword === currentPassword) {
-      return res.status(400).json({ error: 'New password must differ from current password' });
-    }
-    const [rows] = await pool.query('SELECT id, password FROM users WHERE id = ?', [userId]);
-    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    if (rows[0].password !== currentPassword) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
-    await pool.query('UPDATE users SET password = ? WHERE id = ?', [newPassword, userId]);
-    res.json({ success: true });
+    const user = rows[0];
+    const valid = await verifyPassword(password, user.password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    await maybeUpgradePasswordHash(pool, user.id, password, user.password);
+    res.json({
+      token: signToken(user),
+      user: sanitizeUser(user),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -191,28 +179,52 @@ app.get('/api/verify/:type/:docId', async (req, res) => {
   }
 });
 
-// Protect all API routes below except health and login
+// Protect all remaining /api routes
 app.use((req, res, next) => {
   if (req.path === '/api/health' || req.path === '/api/auth/login' || req.path.startsWith('/api/verify/')) {
     return next();
   }
-  if (!req.path.startsWith('/api/')) return next();
-
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  const token = header.slice(7);
-  const user = sessions.get(token);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-  req.user = user;
+  if (req.url.startsWith('/api/')) return requireAuth(req, res, next);
   next();
 });
 
-app.get('/api/auth/me', (req, res) => {
-  res.json({ user: req.user });
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT id, username, name, role, email, created_at as createdAt FROM users WHERE id = ?',
+      [req.user.sub]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/change-password', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    const currentPassword = String(req.body?.currentPassword || '');
+    const newPassword = String(req.body?.newPassword || '');
+    if (!userId || !currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'User ID, current password and new password are required' });
+    }
+    if (req.user.sub !== userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+    const [rows] = await pool.query('SELECT id, password FROM users WHERE id = ?', [userId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const valid = await verifyPassword(currentPassword, rows[0].password);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hash = await hashPassword(newPassword);
+    await pool.query('UPDATE users SET password = ? WHERE id = ?', [hash, userId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ============ USERS ============
@@ -796,6 +808,17 @@ app.get('/api/dashboard/stats', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`SM Trade API running on port ${PORT}`);
+  console.log(`DB: ${DB_NAME} @ ${DB_HOST}`);
+});
+
+server.on('error', (err) => {
+  console.error('Failed to start server:', err.message);
+  process.exit(1);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  process.exit(1);
 });
