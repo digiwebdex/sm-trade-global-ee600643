@@ -5,6 +5,7 @@ import jsPDF from 'jspdf';
 import { CompanySettings, LineItem, ChallanItem, Payment } from '@/types';
 import { numberToWords } from '@/utils/numberToWords';
 import { api } from '@/utils/api';
+import { computeBodyPageSlices } from '@/utils/pdfPageSlices';
 import logoImg from '@/assets/logo.png';
 
 interface DocumentPreviewProps {
@@ -153,8 +154,7 @@ export async function downloadDocument(docNumber: string) {
 
     // ---------- Row-aware safe split points ----------
     // To avoid cutting a table row in the middle, we collect the bottom-edge
-    // pixel position (within bodyCanvas) of every <tr> inside bodyEl. We can
-    // only split the body image at one of these safe positions.
+    // pixel position (within bodyCanvas) of every <tr> / [data-pdf-section].
     const bodyRect = bodyEl.getBoundingClientRect();
     const cssBodyHeight = Math.max(bodyRect.height, bodyEl.scrollHeight);
     const cssToCanvasY = bodyCanvas.height / cssBodyHeight; // px(canvas) per px(css)
@@ -168,60 +168,29 @@ export async function downloadDocument(docNumber: string) {
         safeCutsPx.push(bottomCanvasPx);
       }
     });
-    // Always allow ending at the very bottom
     safeCutsPx.push(bodyCanvas.height);
-    // Sort + dedupe
-    const safeCuts = Array.from(new Set(safeCutsPx)).sort((a, b) => a - b);
 
-    // Pick the largest safe cut that fits within `maxPx` pixels from `startPx`.
-    // If no row boundary fits (single row taller than page), fall back to maxPx.
-    const pickCut = (startPx: number, maxPx: number, remainingPx: number): number => {
-      const limit = startPx + maxPx;
-      let best = -1;
-      for (const c of safeCuts) {
-        if (c <= startPx) continue;
-        if (c <= limit) {
-          if (c > best) best = c;
-        } else {
-          break;
-        }
-      }
-      if (best === -1) {
-        // No row boundary fits — force a hard cut to make progress
-        return startPx + Math.min(maxPx, remainingPx);
-      }
-      return best;
-    };
+    // Build page slices so last page always reserves footer space (keeps Total Amount visible)
+    const pageSlices = computeBodyPageSlices(
+      bodyCanvas.height,
+      sliceHeightPx,
+      sliceHeightLastPx,
+      safeCutsPx,
+    );
 
     let renderedPx = 0;
-    let pageIndex = 0;
-    while (renderedPx < bodyCanvas.height) {
+    for (let pageIndex = 0; pageIndex < pageSlices.length; pageIndex++) {
       if (pageIndex > 0) pdf.addPage();
 
       // Header on every page
       pdf.addImage(headerImg, 'JPEG', sideMargin, topMargin, contentWidth, headerHeightMm);
 
-      const remainingPx = bodyCanvas.height - renderedPx;
-
-      // Try assuming THIS is the last page (footer reserved). If full remainder fits
-      // at a safe row boundary, consume it all. Otherwise this is a middle page —
-      // pick the largest row boundary that fits without footer reservation.
-      let thisSlicePx: number;
-      const fitsAsLast = remainingPx <= sliceHeightLastPx;
-      if (fitsAsLast) {
-        thisSlicePx = remainingPx;
-      } else {
-        const cutAt = pickCut(renderedPx, sliceHeightPx, remainingPx);
-        thisSlicePx = cutAt - renderedPx;
-        if (thisSlicePx <= 0) {
-          // safety: force minimum forward progress
-          thisSlicePx = Math.min(sliceHeightPx, remainingPx);
-        }
-      }
+      const thisSlicePx = pageSlices[pageIndex];
+      const isLastPage = pageIndex === pageSlices.length - 1;
 
       const sliceCanvas = document.createElement('canvas');
       sliceCanvas.width = bodyCanvas.width;
-      sliceCanvas.height = thisSlicePx;
+      sliceCanvas.height = Math.max(1, thisSlicePx);
       const ctx = sliceCanvas.getContext('2d');
       if (ctx) {
         ctx.fillStyle = '#ffffff';
@@ -233,16 +202,12 @@ export async function downloadDocument(docNumber: string) {
       pdf.addImage(sliceImg, 'JPEG', sideMargin, topMargin + headerHeightMm, contentWidth, thisSliceMm);
 
       renderedPx += thisSlicePx;
-      pageIndex += 1;
 
-      // Footer ONLY on the last page
-      if (renderedPx >= bodyCanvas.height) {
+      // Footer ONLY on the last page (space was reserved via bodyAvailLastMm)
+      if (isLastPage) {
         const footerY = pdfHeight - bottomMargin - footerHeightMm;
         pdf.addImage(footerImg, 'JPEG', sideMargin, footerY, contentWidth, footerHeightMm);
       }
-
-      // Safety cap
-      if (pageIndex > 30) break;
     }
 
     pdf.save(`${docNumber}.pdf`);
@@ -471,7 +436,8 @@ export default function DocumentPreview(props: DocumentPreviewProps) {
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 marginTop: '12px', padding: '10px 16px',
                 backgroundColor: NAVY, borderRadius: '4px',
-                position: 'relative', zIndex: 1
+                position: 'relative', zIndex: 1,
+                breakInside: 'avoid', pageBreakInside: 'avoid',
               }}>
                 <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#fff' }}>Total Amount</span>
                 <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#fff' }}>BDT {formatNumber(isInvoice ? grandTotal : subtotal)}</span>
