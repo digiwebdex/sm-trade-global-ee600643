@@ -5,7 +5,7 @@ import jsPDF from 'jspdf';
 import { CompanySettings, LineItem, ChallanItem, Payment } from '@/types';
 import { numberToWords } from '@/utils/numberToWords';
 import { api } from '@/utils/api';
-import { computeBodyPageSlices } from '@/utils/pdfPageSlices';
+import { computeBodyPageSlices, type KeepRange } from '@/utils/pdfPageSlices';
 import logoImg from '@/assets/logo.png';
 
 interface DocumentPreviewProps {
@@ -159,23 +159,28 @@ export async function downloadDocument(docNumber: string) {
     const cssBodyHeight = Math.max(bodyRect.height, bodyEl.scrollHeight);
     const cssToCanvasY = bodyCanvas.height / cssBodyHeight; // px(canvas) per px(css)
     const safeCutsPx: number[] = [];
-    const safeSections = bodyEl.querySelectorAll('tr, [data-pdf-section]');
-    safeSections.forEach((section) => {
-      const r = (section as HTMLElement).getBoundingClientRect();
-      const bottomCssRelative = r.bottom - bodyRect.top;
-      const bottomCanvasPx = Math.round(bottomCssRelative * cssToCanvasY);
-      if (bottomCanvasPx > 0 && bottomCanvasPx <= bodyCanvas.height) {
-        safeCutsPx.push(bottomCanvasPx);
+    const keepTogether: KeepRange[] = [];
+    bodyEl.querySelectorAll('tr, [data-pdf-section]').forEach((section) => {
+      const el = section as HTMLElement;
+      const r = el.getBoundingClientRect();
+      const topPx = Math.round((r.top - bodyRect.top) * cssToCanvasY);
+      const bottomPx = Math.round((r.bottom - bodyRect.top) * cssToCanvasY);
+      if (bottomPx > 0 && bottomPx <= bodyCanvas.height) safeCutsPx.push(bottomPx);
+      if (el.hasAttribute('data-pdf-keep') || el.getAttribute('data-pdf-section') === 'totals') {
+        keepTogether.push({
+          start: Math.max(0, topPx),
+          end: Math.min(bodyCanvas.height, Math.max(bottomPx, topPx + 1)),
+        });
       }
     });
     safeCutsPx.push(bodyCanvas.height);
 
-    // Build page slices so last page always reserves footer space (keeps Total Amount visible)
     const pageSlices = computeBodyPageSlices(
       bodyCanvas.height,
       sliceHeightPx,
       sliceHeightLastPx,
       safeCutsPx,
+      keepTogether,
     );
 
     let renderedPx = 0;
@@ -432,24 +437,27 @@ export default function DocumentPreview(props: DocumentPreviewProps) {
                 </tbody>
               </table>
 
-              <div data-pdf-section style={{ 
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                marginTop: '12px', padding: '10px 16px',
-                backgroundColor: NAVY, borderRadius: '4px',
-                position: 'relative', zIndex: 1,
+              <div data-pdf-section="totals" data-pdf-keep style={{
+                marginTop: '12px', position: 'relative', zIndex: 2,
                 breakInside: 'avoid', pageBreakInside: 'avoid',
               }}>
-                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#fff' }}>Total Amount</span>
-                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#fff' }}>BDT {formatNumber(isInvoice ? grandTotal : subtotal)}</span>
+                <div style={{ 
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '10px 16px', minHeight: '40px',
+                  backgroundColor: NAVY, borderRadius: '4px',
+                }}>
+                  <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#FFFFFF', WebkitTextFillColor: '#FFFFFF' }}>Total Amount</span>
+                  <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#FFFFFF', WebkitTextFillColor: '#FFFFFF' }}>BDT {formatNumber(isInvoice ? grandTotal : subtotal)}</span>
+                </div>
+                {totalAmount !== undefined && totalAmount > 0 && (
+                  <div style={{ textAlign: 'right', padding: '4px 0 0', fontSize: '11px', color: NAVY }}>
+                    <strong>In Word :</strong> {props.amountInWords || numberToWords(isInvoice ? balance : subtotal)}.
+                  </div>
+                )}
               </div>
             </>
           ) : null}
 
-          {totalAmount !== undefined && totalAmount > 0 && !isChallan && (
-            <div data-pdf-section style={{ textAlign: 'right', padding: '0', fontSize: '11px', color: NAVY, marginTop: '4px' }}>
-              <strong>In Word :</strong> {props.amountInWords || numberToWords(isInvoice ? balance : subtotal)}.
-            </div>
-          )}
 
           {isInvoice && payments && payments.length > 0 && (
             <div data-pdf-section style={{ marginTop: '16px', position: 'relative', zIndex: 1 }}>

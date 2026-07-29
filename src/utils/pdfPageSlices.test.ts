@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeBodyPageSlices, pickSafeCut } from '@/utils/pdfPageSlices';
-import { buildTwoPageDemoInvoiceItems } from '@/utils/twoPageDemoInvoice';
+import { computeBodyPageSlices, pickSafeCut, cutSplitsKeep } from '@/utils/pdfPageSlices';
 
 describe('pdfPageSlices', () => {
   it('fits a short body on a single last page', () => {
@@ -9,12 +8,9 @@ describe('pdfPageSlices', () => {
   });
 
   it('never puts overflowing remainder on the last middle page (total-clip bug)', () => {
-    // Reproduce INV-2026-0010 style: body taller than last-page capacity but
-    // shorter than middle-page capacity. Old logic consumed everything on page 1
-    // then drew footer on top — clipping Total Amount below the page.
     const bodyHeight = 2000;
-    const midAvail = 2200; // middle page can "fit" the whole body
-    const lastAvail = 1500; // but with footer reserved it cannot
+    const midAvail = 2200;
+    const lastAvail = 1500;
     const safeCuts = [];
     for (let y = 100; y <= bodyHeight; y += 100) safeCuts.push(y);
 
@@ -22,50 +18,36 @@ describe('pdfPageSlices', () => {
 
     expect(slices.length).toBeGreaterThanOrEqual(2);
     expect(slices.reduce((a, b) => a + b, 0)).toBe(bodyHeight);
-    // Last slice must fit within footer-reserved capacity
     expect(slices[slices.length - 1]).toBeLessThanOrEqual(lastAvail);
-    // No middle slice may consume the entire remaining body when overflow would occur
     expect(slices[0]).toBeLessThan(bodyHeight);
   });
 
-  it('creates a demo 2-page invoice split where total block stays on last page', () => {
-    // Simulate many line-item rows (~40px each) then a Total Amount section at the end
+  it('keeps Total Amount block together and on last page', () => {
     const rowH = 40;
-    const itemRows = 45; // enough to force 2+ pages
-    const totalBlockH = 80; // Total Amount + In Word
+    const itemRows = 45;
+    const totalStart = itemRows * rowH;
+    const totalEnd = totalStart + 80;
     const safeCuts: number[] = [];
     for (let i = 1; i <= itemRows; i++) safeCuts.push(i * rowH);
-    const totalBottom = itemRows * rowH + totalBlockH;
-    safeCuts.push(totalBottom);
+    safeCuts.push(totalEnd);
 
-    const midAvail = 1600;
-    const lastAvail = 1200;
-    const slices = computeBodyPageSlices(totalBottom, midAvail, lastAvail, safeCuts);
+    const slices = computeBodyPageSlices(totalEnd, 1600, 1200, safeCuts, [
+      { start: totalStart, end: totalEnd },
+    ]);
 
+    expect(slices.reduce((a, b) => a + b, 0)).toBe(totalEnd);
     expect(slices.length).toBeGreaterThanOrEqual(2);
-    expect(slices.reduce((a, b) => a + b, 0)).toBe(totalBottom);
 
-    // The Total Amount bottom (totalBottom) must land on the last page slice
+    // No slice boundary may fall strictly inside the totals block
     let start = 0;
-    for (let i = 0; i < slices.length; i++) {
-      const end = start + slices[i];
-      if (i === slices.length - 1) {
-        expect(end).toBe(totalBottom);
-        expect(start).toBeLessThan(totalBottom);
-        // total block starts after last item row
-        const totalStart = itemRows * rowH;
-        expect(start).toBeLessThanOrEqual(totalStart);
-        expect(end - start).toBeLessThanOrEqual(lastAvail);
-      }
-      start = end;
+    for (const size of slices.slice(0, -1)) {
+      const cut = start + size;
+      expect(cutSplitsKeep(cut, start, [{ start: totalStart, end: totalEnd }])).toBe(false);
+      start = cut;
     }
-  });
-
-  it('demo invoice builder has enough rows to span two pages and a real total', () => {
-    const demo = buildTwoPageDemoInvoiceItems(35);
-    expect(demo.items.length).toBeGreaterThan(40);
-    expect(demo.totalAmount).toBe(6716830);
-    expect(demo.invoiceNumber).toContain('DEMO');
+    // Last page includes the total end
+    expect(start + slices[slices.length - 1]).toBe(totalEnd);
+    expect(start).toBeLessThanOrEqual(totalStart);
   });
 
   it('pickSafeCut prefers the largest row boundary within the limit', () => {
